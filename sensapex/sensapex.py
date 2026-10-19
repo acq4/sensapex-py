@@ -187,7 +187,7 @@ class MoveRequest(object):
         self.interrupted = False
         self.last_pos = None
         self.attempts = 0
-        self.max_attempts = max_attempts
+        self.max_attempts = 5 if max_attempts is None else max_attempts
         self.retry_threshold = np.array([retry_threshold] * 4)
         self.fail_threshold = np.array([fail_threshold] * 4)
         self.speed = speed
