@@ -123,6 +123,40 @@ class um_state(Structure):
     ]
 
 
+def _fmt_row(values, widths=None):
+    """Format one row of per-axis values; NaN (an axis left out of the request) prints as --."""
+    cells = ["--" if v is None or not np.isfinite(v) else f"{v:.1f}" for v in values]
+    if widths is None:
+        widths = [max(len(c) for c in cells)] * len(cells)
+    return "(" + ", ".join(f"{c:>{w}}" for c, w in zip(cells, widths)) + ")"
+
+
+def _default_device_limits(dev_id, n_axes=None):
+    """Return default (min, max) µm limits per axis for *dev_id*, or None if unknown.
+
+    uMp manipulators (id 1–19) have a documented 20 mm travel range per axis.
+    uMs stages (id 20–29) vary by model (25 mm, 50 mm, …) so no default is
+    assumed — configure limits explicitly in ACQ4.
+    Other device types (pressure controllers, etc.) are not positional.
+    """
+    if dev_id < 20:
+        n = n_axes if n_axes is not None else 4
+        return [(0, 20000)] * n
+    return None
+
+
+def _fmt_position_block(labeled_rows):
+    """Format labeled per-axis rows into a column-aligned block."""
+    cells = [["--" if v is None or not np.isfinite(v) else f"{v:.1f}" for v in row] for _, row in labeled_rows]
+    n_cols = max(len(row) for row in cells)
+    # rows may be ragged: a 3-axis device still commands 4 axis values
+    widths = [max(len(row[i]) for row in cells if i < len(row)) for i in range(n_cols)]
+    label_w = max(len(label) for label, _ in labeled_rows)
+    return "\n".join(
+        f"{label:>{label_w}}: " + _fmt_row(row, widths) for (label, row) in labeled_rows
+    )
+
+
 class MoveRequest(object):
     """Class for coordinating and tracking moves."""
 
@@ -139,12 +173,14 @@ class MoveRequest(object):
         fail_threshold=1.0,
         name=None,
         max_attempts=5,
+        limits=None,
     ):
         self._stack = traceback.StackSummary.extract(traceback.walk_stack(None))
         self._next_move_index = 0
         self.last_pos_exception = None
         self.name = name
         self.dev = dev
+        self.limits = limits
         self.finished = False
         self.finished_event = threading.Event()
         self.interrupt_reason = None
@@ -197,6 +233,15 @@ class MoveRequest(object):
             else:
                 max_acceleration = 0
 
+        # Remember how the move was actually commanded. When a move misses its target the
+        # final position rarely explains why on its own; the speeds, the movement mode and
+        # which axes were left out of the request usually do.
+        self.simultaneous = simultaneous
+        self.linear = linear
+        self.max_acceleration = max_acceleration
+        self.commanded_dest = np.array(dest4, dtype=float)
+        self.axis_speeds = np.array(speed, dtype=float)
+
         if simultaneous:
             self.estimated_duration = max(np.array(diff) / speed[: len(diff)])
             self._moves = (self._movement_args(max_acceleration, dest4, speed, simultaneous),)
@@ -235,6 +280,23 @@ class MoveRequest(object):
                     self._movement_args(max_acceleration, just_xz, speed, simultaneous),
                     self._movement_args(max_acceleration, dest4, speed, simultaneous),
                 )
+
+    def describe_request(self) -> str:
+        """Return a description of the parameters this move was issued with.
+
+        Appended to failure messages so a missed target can be diagnosed without
+        digging the request back out of the caller.
+        """
+        return "\n".join([
+            f"     axis speed: {_fmt_row(self.axis_speeds)} um/s (requested {self.speed!r})",
+            f"           mode: simultaneous={self.simultaneous}, linear={self.linear}, "
+            f"max_acceleration={self.max_acceleration}",
+            f"     thresholds: retry={float(self.retry_threshold[0]):g} um, "
+            f"fail={float(self.fail_threshold[0]):g} um, max_attempts={self.max_attempts}",
+            f"         timing: {timer() - self.start_time:.2f} s elapsed, "
+            f"{self.estimated_duration:.2f} s estimated",
+            f"        request: name={self.name!r}, device={self.dev}",
+        ])
 
     def _movement_args(self, max_acceleration, pos4, speed, simultaneous) -> List[Union[c_int, c_float]]:
         mode = int(bool(simultaneous))  # whether all axes move simultaneously
@@ -683,7 +745,7 @@ class UMP(object):
         self._write_debug(f"positions: {positions!r}")
         return positions
 
-    def goto_pos(self, dev, dest, speed, simultaneous=True, linear=False, max_acceleration=0, name=None, max_attempts=None):
+    def goto_pos(self, dev, dest, speed, simultaneous=True, linear=False, max_acceleration=0, name=None, max_attempts=None, limits=None):
         """Request the specified device to move to an absolute position (in um).
 
         Parameters
@@ -723,6 +785,7 @@ class UMP(object):
             self._fail_threshold,
             name=name,
             max_attempts=max_attempts,
+            limits=limits,
         )
         logger = self.get_logger(dev)
         logger.debug(f"Move to {dest!r} speed={speed} simultaneous={simultaneous}, linear={linear}, max_acceleration={max_acceleration}, name={name!r}")
@@ -730,6 +793,8 @@ class UMP(object):
             last_move = self._last_move.get(dev, None)
             if last_move is not None:
                 name = '' if name is None else f' ({name})'
+                # Interrupt is required here; otherwise uMp finishes the previous move
+                # before starting the new one.
                 last_move.interrupt(f"started another move before the previous finished{name}")
 
             self._last_move[dev] = next_move
@@ -942,12 +1007,42 @@ class UMP(object):
                             )
                             diff = np.abs(pos - move.target_pos)
                             axes_different = np.where(diff > move.fail_threshold)[0]
-                            axis_msg = ", ".join([f"axis {i}: {diff[i]}" for i in axes_different])
+                            axis_msg = ", ".join([f"axis {i}: {diff[i]:.1f}" for i in axes_different])
+
+                            coord_block = _fmt_position_block([
+                                ("final position", pos),
+                                ("target position", move.target_pos),
+                                ("diff", diff),
+                                ("start position", move.start_pos),
+                                ("commanded axes", move.commanded_dest),
+                            ])
+                            limit_hint = ""
+                            if move.limits is not None:
+                                limit_proximity_threshold = 50.0  # µm; coarser than fail_threshold to catch soft stops near a bound
+                                at_limit = []
+                                for ax in axes_different:
+                                    if ax >= len(move.limits):
+                                        continue
+                                    low, high = move.limits[ax]
+                                    tgt = move.target_pos[ax]
+                                    if low is not None and abs(tgt - low) <= limit_proximity_threshold:
+                                        at_limit.append(f"axis {ax} (target {tgt:.3g} = configured min {low} µm)")
+                                    elif high is not None and abs(tgt - high) <= limit_proximity_threshold:
+                                        at_limit.append(f"axis {ax} (target {tgt:.3g} = configured max {high} µm)")
+                                if at_limit:
+                                    limit_hint = (
+                                        f"\nTarget for {', '.join(at_limit)} is at a configured limit."
+                                        f" If the device stopped short, its physical limit may not match"
+                                        f" the configured limit — try re-zeroing the device and"
+                                        f" re-saving any stored positions (home, etc.)."
+                                    )
                             move.interrupt(
-                                f"move finished but did not reach target position "
-                                f"(final position {pos!r} differs from target {move.target_pos!r} "
-                                f"by more than {move.fail_threshold!r} on {axis_msg}; "
-                                f"attempted {move.attempts} times)"
+                                f"move finished but did not reach target position\n"
+                                f"{coord_block}\n"
+                                f"exceeded threshold {float(move.fail_threshold[0]):g} um on {axis_msg}; "
+                                f"attempted {move.attempts} times\n"
+                                f"{move.describe_request()}"
+                                f"{limit_hint}"
                             )
                         else:
                             logger.debug(f'move completed successfully')
@@ -997,10 +1092,11 @@ class SensapexDevice(object):
         dev.goto_pos(pos, speed=10)
     """
 
-    def __init__(self, dev_id: int, callback=None, n_axes=None, max_acceleration=0, is_stage=None):
+    def __init__(self, dev_id: int, callback=None, n_axes=None, max_acceleration=0, is_stage=None, limits=None):
         self.dev_id = dev_id
         self._is_stage = is_stage
         self.ump = UMP.get_ump()
+        self._limits = limits if limits is not None else _default_device_limits(dev_id, n_axes)
 
         # Save max acceleration from config
         if max_acceleration is None:
@@ -1018,6 +1114,10 @@ class SensapexDevice(object):
         if callback is not None:
             self.add_callback(callback)
 
+    def set_limits(self, limits):
+        """Set per-axis (min, max) µm limits, used to annotate missed-target errors."""
+        self._limits = limits
+
     def set_n_axes(self, n_axes):
         self.ump.set_axis_count(self.dev_id, n_axes)
 
@@ -1034,8 +1134,20 @@ class SensapexDevice(object):
         return self.ump.get_pos(self.dev_id, timeout=timeout)
 
     def goto_pos(self, pos, speed, simultaneous=True, linear=False, max_acceleration=0, name=None, max_attempts=None):
+        if self._limits is not None:
+            violations = []
+            for i, val in enumerate(pos):
+                if i >= len(self._limits) or val is None or (isinstance(val, float) and np.isnan(val)):
+                    continue
+                low, high = self._limits[i]
+                if low is not None and val < low:
+                    violations.append(f"axis {i}: {val:.3g} < min {low} µm")
+                elif high is not None and val > high:
+                    violations.append(f"axis {i}: {val:.3g} > max {high} µm")
+            if violations:
+                raise ValueError(f"Requested position is outside limits for device {self.dev_id}: {'; '.join(violations)}")
         return self.ump.goto_pos(
-            self.dev_id, pos, speed, simultaneous=simultaneous, linear=linear, max_acceleration=max_acceleration, name=name, max_attempts=max_attempts
+            self.dev_id, pos, speed, simultaneous=simultaneous, linear=linear, max_acceleration=max_acceleration, name=name, max_attempts=max_attempts, limits=self._limits
         )
 
     def take_step(self, distance, speed, mode=0, max_acceleration=0):
