@@ -28,6 +28,7 @@ import traceback
 import numpy as np
 import os
 import platform
+import re
 import subprocess
 import sys
 import threading
@@ -70,6 +71,18 @@ LIBUM_TIMEOUT = -3  # Timeout occurred
 LIBUM_INVALID_ARG = -4  # Illegal command argument
 LIBUM_INVALID_DEV = -5  # Illegal Device Id
 LIBUM_INVALID_RESP = -6  # Illegal response received
+
+# um_get_drive_status values (these are statuses, not errors)
+LIBUM_POS_DRIVE_COMPLETED = 0
+LIBUM_POS_DRIVE_BUSY = 1
+LIBUM_POS_DRIVE_FAILED = -1
+
+# Largest position change (µm) a goto can cause and still count as refused before moving.
+REFUSED_GOTO_MOTION_TOLERANCE = 0.5
+
+# libum logs each goto completion code, which um_get_drive_status reduces to COMPLETED/FAILED.
+_DRIVE_STATUS_LOG_RE = re.compile(rb"dev (\d+) updated drive status (-?\d+)")
+um_log_print_func = CFUNCTYPE(None, c_int, c_void_p, c_char_p, c_char_p)
 
 
 class sockaddr_in(Structure):
@@ -187,6 +200,16 @@ class MoveRequest(object):
         self.interrupted = False
         self.last_pos = None
         self.attempts = 0
+        # per-goto bookkeeping, reset by make_next_call()
+        self._sent_at = None
+        self._sent_pos = None
+        self._send_error = None
+        self._motion_seen = False
+        # refused gotos (device answered FAILED without moving); these do not count as attempts
+        self.refusals = 0
+        self.unacknowledged = 0
+        self._refusal_streak_start = None
+        self.last_completion_code = None
         self.max_attempts = 5 if max_attempts is None else max_attempts
         self.retry_threshold = np.array([retry_threshold] * 4)
         self.fail_threshold = np.array([fail_threshold] * 4)
@@ -361,10 +384,67 @@ class MoveRequest(object):
         return self._next_move_index < len(self._moves)
 
     def make_next_call(self):
+        self._sent_pos = self._read_position()
+        self._sent_at = timer()
+        self._send_error = None
+        self._motion_seen = False
         try:
             self.ump.call("um_goto_position_ext", *self._moves[self._next_move_index])
+        except UMError as err:
+            # e.g. no ACK after libum's retransmits; the drive status is then FAILED
+            self._send_error = err
+            raise
         finally:
             self._next_move_index += 1
+
+    def resend_current_call(self):
+        """Send the most recent goto again, without counting it as a new attempt."""
+        self._next_move_index -= 1
+        try:
+            self.make_next_call()
+        except UMError:
+            pass  # recorded in _send_error; the FAILED drive status brings us back here
+
+    def note_motion(self):
+        """Record that the device was seen moving since the last goto was sent."""
+        self._motion_seen = True
+        self._refusal_streak_start = None
+
+    def was_refused(self):
+        """Return True if the last goto ended without the device ever moving.
+
+        Call only once the drive status is FAILED. A goto aborted mid-move shows motion first.
+        """
+        if self._motion_seen or self._sent_pos is None:
+            return False
+        moved = np.abs(self._read_position() - self._sent_pos)
+        return bool(np.all(moved[np.isfinite(moved)] < REFUSED_GOTO_MOTION_TOLERANCE))
+
+    def note_refusal(self, completion_code):
+        """Record a refused goto and return seconds since the current run of refusals began."""
+        now = timer()
+        if self._send_error is not None:
+            self.unacknowledged += 1
+        else:
+            self.refusals += 1
+        self.last_completion_code = completion_code
+        if self._refusal_streak_start is None:
+            self._refusal_streak_start = self._sent_at
+        return now - self._refusal_streak_start
+
+    def note_accepted(self):
+        """Record that the last goto was carried out (it completed, or the device moved)."""
+        self._refusal_streak_start = None
+
+    def describe_refusals(self) -> str:
+        """Return a summary line of refused and unacknowledged gotos, or '' if there were none."""
+        if not (self.refusals or self.unacknowledged):
+            return ""
+        code = "unavailable" if self.last_completion_code is None else self.last_completion_code
+        return (
+            f"\n       refusals: {self.refusals} goto(s) refused by the device without moving, "
+            f"{self.unacknowledged} unacknowledged; last completion code {code}"
+        )
 
 
 class UMError(Exception):
@@ -484,6 +564,10 @@ class UMP(object):
 
         self._retry_threshold = 0.1
         self._fail_threshold = 0.999
+        # A refused goto is resent until it has been refused for this many seconds in a row.
+        self.refused_goto_timeout = 3.0
+        self._completion_codes = {}  # {device: (raw goto completion code, time received)}
+        self._log_cb = None
         self.default_max_accelerations = {}
 
         self.lib = self.get_lib()
@@ -710,8 +794,34 @@ class UMP(object):
         if ptr <= 0:
             raise RuntimeError("Error connecting to UM:", self.lib.um_errorstr(ptr))
         self.h = pointer(self.get_um_state_class().from_address(ptr))
+        self._install_log_hook()
         if self._handle_atexit:
             atexit.register(self.close)
+
+    def _install_log_hook(self):
+        """Capture libum's log so the raw goto completion code of each device is available.
+
+        um_get_drive_status only reports COMPLETED or FAILED; the code saying why a goto
+        failed appears only in libum's level-2 log line "dev N updated drive status C".
+        """
+        def log_cb(level, arg, func, message):
+            try:
+                m = _DRIVE_STATUS_LOG_RE.search(message or b"")
+                if m is not None:
+                    self._completion_codes[int(m.group(1))] = (int(m.group(2)), timer())
+                if self._debug:
+                    self._write_debug(f"libum[{level}] {(message or b'').decode(errors='replace')}")
+            except Exception:
+                pass  # never raise into C
+
+        self._log_cb = um_log_print_func(log_cb)  # keep a reference; libum holds a raw pointer
+        if self.lib.um_set_log_func(self.h, c_int(2), self._log_cb, None) < 0:
+            warnings.warn("um_set_log_func failed; goto completion codes will be unavailable")
+
+    def completion_code(self, dev, since):
+        """Return the raw completion code of *dev*'s last goto if it arrived after *since*, else None."""
+        code, t = self._completion_codes.get(dev, (None, None))
+        return code if t is not None and t >= since else None
 
     def close(self):
         """Close the UM device."""
@@ -863,14 +973,26 @@ class UMP(object):
         Note: this should not be used to determine whether a move has completed;
         use MoveRequest.finished or .finished_event as returned from goto_pos().
         """
-        # idle/complete=0; moving>0; failed<0
-        try:
-            return self.call("um_get_drive_status", c_int(dev)) > 0
-        except UMError as err:
-            if err.errno in (LIBUM_NOT_OPEN, LIBUM_INVALID_DEV):
-                raise
-            else:
-                return False
+        return self.get_drive_status(dev) == LIBUM_POS_DRIVE_BUSY
+
+    def get_drive_status(self, dev):
+        """Return the status of *dev*'s most recent goto: LIBUM_POS_DRIVE_BUSY, _COMPLETED or _FAILED.
+
+        This is libum's cached state, updated when packets are received. FAILED (-1) is a status,
+        so this bypasses call(), which would report it with an unrelated stale error code.
+        """
+        with self.lock:
+            if self.h is None:
+                raise TypeError("UM is not open.")
+            status = self.lib.um_get_drive_status(self.h, c_int(dev))
+        if status in (LIBUM_POS_DRIVE_BUSY, LIBUM_POS_DRIVE_COMPLETED, LIBUM_POS_DRIVE_FAILED):
+            return status
+        raise UMError(f"UM Error: {status} from um_get_drive_status({dev})", status, None)
+
+    def is_motor_active(self, dev):
+        """Return True if *dev*'s last pushed status reports it busy or moving."""
+        with self.lock:
+            return bool(self.lib.um_is_busy(self.h, c_int(dev)))
 
     def stop(self, dev, reason=None):
         """Stop the specified manipulator."""
@@ -990,66 +1112,119 @@ class UMP(object):
             for dev, move in list(self._last_move.items()):
                 logger = self.get_logger(dev)
                 try:
-                    if move.is_in_progress():
-                        continue
-                    if move.has_more_calls_to_make():
-                        move.make_next_call()
-                    elif move.can_retry() and move.should_retry():
-                        logger.debug(f'retry last move (attempt {move.attempts + 1}/{move.max_attempts})')
-                        move.start()
-                    else:
-                        self._last_move.pop(dev)
-                        if not move.reached_target():
-                            pos = move._read_position()
-                            logger.debug(
-                                f'move finished but final position {pos!r} differs from target '
-                                f'{move.target_pos!r} by more than {move.fail_threshold!r}'
-                            )
-                            diff = np.abs(pos - move.target_pos)
-                            axes_different = np.where(diff > move.fail_threshold)[0]
-                            axis_msg = ", ".join([f"axis {i}: {diff[i]:.1f}" for i in axes_different])
-
-                            coord_block = _fmt_position_block([
-                                ("final position", pos),
-                                ("target position", move.target_pos),
-                                ("diff", diff),
-                                ("start position", move.start_pos),
-                                ("commanded axes", move.commanded_dest),
-                            ])
-                            limit_hint = ""
-                            if move.limits is not None:
-                                limit_proximity_threshold = 50.0  # µm; coarser than fail_threshold to catch soft stops near a bound
-                                at_limit = []
-                                for ax in axes_different:
-                                    if ax >= len(move.limits):
-                                        continue
-                                    low, high = move.limits[ax]
-                                    tgt = move.target_pos[ax]
-                                    if low is not None and abs(tgt - low) <= limit_proximity_threshold:
-                                        at_limit.append(f"axis {ax} (target {tgt:.3g} = configured min {low} µm)")
-                                    elif high is not None and abs(tgt - high) <= limit_proximity_threshold:
-                                        at_limit.append(f"axis {ax} (target {tgt:.3g} = configured max {high} µm)")
-                                if at_limit:
-                                    limit_hint = (
-                                        f"\nTarget for {', '.join(at_limit)} is at a configured limit."
-                                        f" If the device stopped short, its physical limit may not match"
-                                        f" the configured limit — try re-zeroing the device and"
-                                        f" re-saving any stored positions (home, etc.)."
-                                    )
-                            move.interrupt(
-                                f"move finished but did not reach target position\n"
-                                f"{coord_block}\n"
-                                f"exceeded threshold {float(move.fail_threshold[0]):g} um on {axis_msg}; "
-                                f"attempted {move.attempts} times\n"
-                                f"{move.describe_request()}"
-                                f"{limit_hint}"
-                            )
-                        else:
-                            logger.debug(f'move completed successfully')
-                            move.finish()
+                    self._update_move(dev, move, logger)
                 except Exception:
                     logger.exception(f"Error processing move on sensapex device {dev}")
                     sys.excepthook(*sys.exc_info())
+
+    def _update_move(self, dev, move, logger):
+        """Advance one pending move according to the drive status of its last goto."""
+        if move.finished:
+            self._last_move.pop(dev, None)
+            return
+        status = self.get_drive_status(dev)
+        if status == LIBUM_POS_DRIVE_BUSY:
+            if self.is_motor_active(dev):
+                move.note_motion()
+            return
+
+        if status == LIBUM_POS_DRIVE_FAILED and move.was_refused():
+            # After any goto completes, the uMp refuses new gotos for a variable time (completion
+            # code 6, no motion). Prompt resends get through soonest, so resend until the timeout.
+            code = self.completion_code(dev, since=move._sent_at)
+            refused_for = move.note_refusal(code)
+            if refused_for < self.refused_goto_timeout and not move.reached_target():
+                logger.debug(f"goto refused (completion code {code}) for {refused_for:.2f} s; resending")
+                move.resend_current_call()
+                return
+            self._last_move.pop(dev)
+            if move.reached_target():
+                logger.debug("goto refused, but position is within the fail threshold")
+                move.finish()
+            else:
+                self._fail_move(move, logger, refused_for=refused_for)
+            return
+
+        if status == LIBUM_POS_DRIVE_FAILED:
+            move.last_completion_code = self.completion_code(dev, since=move._sent_at)
+            logger.debug(f"goto failed after moving (completion code {move.last_completion_code})")
+        move.note_accepted()
+        if move.has_more_calls_to_make():
+            try:
+                move.make_next_call()
+            except UMError:
+                pass  # recorded on the move; the FAILED drive status is handled on the next update
+        elif move.can_retry() and move.should_retry():
+            logger.debug(f'retry last move (attempt {move.attempts + 1}/{move.max_attempts})')
+            move.start()
+        else:
+            self._last_move.pop(dev)
+            if move.reached_target():
+                logger.debug('move completed successfully')
+                move.finish()
+            else:
+                self._fail_move(move, logger)
+
+    def _fail_move(self, move, logger, refused_for=None):
+        """Interrupt *move* with a message describing how and where it fell short of its target."""
+        pos = move._read_position()
+        target = np.array(move.target_pos, dtype=float)  # None -> nan
+        logger.debug(
+            f'move finished but final position {pos!r} differs from target '
+            f'{move.target_pos!r} by more than {move.fail_threshold!r}'
+        )
+        code = move.last_completion_code
+        code_str = "unavailable" if code is None else str(code)
+        if refused_for is not None and move.refusals == 0:
+            headline = (f"device did not acknowledge the goto for {refused_for:.2f} s "
+                        f"({move.unacknowledged} sends) and never started moving")
+        elif refused_for is not None:
+            headline = (f"device refused the goto for {refused_for:.2f} s and never started moving "
+                        f"(completion code {code_str})")
+        elif code not in (None, 0, 2):
+            headline = f"move failed with completion code {code} before reaching target position"
+        else:
+            headline = "move finished but did not reach target position"
+
+        diff = np.abs(pos - target)
+        axes_different = np.where(diff > move.fail_threshold)[0]
+        axis_msg = ", ".join([f"axis {i}: {diff[i]:.1f}" for i in axes_different])
+        coord_block = _fmt_position_block([
+            ("final position", pos),
+            ("target position", target),
+            ("diff", diff),
+            ("start position", move.start_pos),
+            ("commanded axes", move.commanded_dest),
+        ])
+        limit_hint = ""
+        if move.limits is not None:
+            limit_proximity_threshold = 50.0  # µm; coarser than fail_threshold to catch soft stops near a bound
+            at_limit = []
+            for ax in axes_different:
+                if ax >= len(move.limits):
+                    continue
+                low, high = move.limits[ax]
+                tgt = target[ax]
+                if low is not None and abs(tgt - low) <= limit_proximity_threshold:
+                    at_limit.append(f"axis {ax} (target {tgt:.3g} = configured min {low} µm)")
+                elif high is not None and abs(tgt - high) <= limit_proximity_threshold:
+                    at_limit.append(f"axis {ax} (target {tgt:.3g} = configured max {high} µm)")
+            if at_limit:
+                limit_hint = (
+                    f"\nTarget for {', '.join(at_limit)} is at a configured limit."
+                    f" If the device stopped short, its physical limit may not match"
+                    f" the configured limit — try re-zeroing the device and"
+                    f" re-saving any stored positions (home, etc.)."
+                )
+        move.interrupt(
+            f"{headline}\n"
+            f"{coord_block}\n"
+            f"exceeded threshold {float(move.fail_threshold[0]):g} um on {axis_msg}; "
+            f"attempted {move.attempts} times\n"
+            f"{move.describe_request()}"
+            f"{move.describe_refusals()}"
+            f"{limit_hint}"
+        )
 
     def track_device_ids(self, *dev_ids):
         for dev in dev_ids:
