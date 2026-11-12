@@ -71,6 +71,14 @@ LIBUM_INVALID_ARG = -4  # Illegal command argument
 LIBUM_INVALID_DEV = -5  # Illegal Device Id
 LIBUM_INVALID_RESP = -6  # Illegal response received
 
+# um_get_drive_status values (these are statuses, not errors)
+LIBUM_POS_DRIVE_COMPLETED = 0
+LIBUM_POS_DRIVE_BUSY = 1
+LIBUM_POS_DRIVE_FAILED = -1
+
+# Oldest uMp firmware known not to refuse gotos sent shortly after a move completes.
+UMP_MIN_FIRMWARE = (1, 26, 46, 101)
+
 
 class sockaddr_in(Structure):
     _fields_ = [
@@ -673,26 +681,38 @@ class UMP(object):
             if self.h is None:
                 raise TypeError("UM is not open.")
             self._write_debug(f"calling SDK {fn} with args {args!r}")
+            start = timer()
             rval = getattr(self.lib, fn)(self.h, *args)
+            elapsed = timer() - start
             self._write_debug(f"{fn}({args!r}) -> {rval}")
             if rval < 0:
-                err = self.lib.um_last_error(self.h)
-                if err == -1:
-                    oserr = self.lib.um_last_os_errno(self.h)
-                    err_msg = f"UM OS Error {oserr:d}: {os.strerror(oserr)}"
-                    exc = UMError(err_msg, None, oserr)
-                else:
-                    errstr = self.lib.um_errorstr(err).decode()
-                    err_msg = f"UM Error: {err:d}: '{errstr}' from {fn}{args!r}"
-                    exc = UMError(err_msg, err, None)
-                self._write_debug(err_msg, error=exc)
+                exc = self._call_error(fn, args, rval, elapsed)
+                self._write_debug(str(exc), error=exc)
                 if retries and retries > 0:
-                    self._write_debug(err_msg)
-                    warnings.warn(err_msg)
-                    return self.call(fn, *args, retries - 1)
-                else:
-                    raise exc
+                    warnings.warn(str(exc))
+                    return self.call(fn, *args, retries=retries - 1)
+                raise exc
             return rval
+
+    def _call_error(self, fn, args, code, elapsed):
+        """Return a UMError for libum function *fn* that returned error *code* after *elapsed* seconds.
+
+        Uses the return value rather than um_last_error, which may hold an earlier call's error.
+        A request that gets no reply returns whatever its last receive returned; that is
+        LIBUM_INVALID_DEV when an unrelated packet arrived last, so it is reported as a timeout.
+        """
+        if code == LIBUM_OS_ERROR:
+            oserr = self.lib.um_last_os_errno(self.h)
+            return UMError(f"UM OS Error {oserr:d}: {os.strerror(oserr)} from {fn}{args!r}", None, oserr)
+        timeout_ms = self.h.contents.timeout
+        if code == LIBUM_INVALID_DEV and elapsed * 1000 >= timeout_ms / 2:
+            return UMError(
+                f"UM Error: no reply from device to {fn} within {elapsed * 1000:.0f} ms "
+                f"(libum returned {code} 'Invalid device id' for an unrelated packet) from {fn}{args!r}",
+                LIBUM_TIMEOUT, None,
+            )
+        errstr = self.lib.um_errorstr(code).decode()
+        return UMError(f"UM Error: {code:d}: '{errstr}' from {fn}{args!r}", code, None)
 
     def set_max_acceleration(self, dev, max_acc):
         self.default_max_accelerations[dev] = max_acc
@@ -863,14 +883,22 @@ class UMP(object):
         Note: this should not be used to determine whether a move has completed;
         use MoveRequest.finished or .finished_event as returned from goto_pos().
         """
-        # idle/complete=0; moving>0; failed<0
-        try:
-            return self.call("um_get_drive_status", c_int(dev)) > 0
-        except UMError as err:
-            if err.errno in (LIBUM_NOT_OPEN, LIBUM_INVALID_DEV):
-                raise
-            else:
-                return False
+        return self.get_drive_status(dev) == LIBUM_POS_DRIVE_BUSY
+
+    def get_drive_status(self, dev):
+        """Return the status of *dev*'s most recent goto: LIBUM_POS_DRIVE_BUSY, _COMPLETED or _FAILED.
+
+        This is libum's cached state, updated when packets are received. FAILED (-1) is a status,
+        so this bypasses call(), which would report it as an error.
+        """
+        with self.lock:
+            if self.h is None:
+                raise TypeError("UM is not open.")
+            status = self.lib.um_get_drive_status(self.h, c_int(dev))
+        if status in (LIBUM_POS_DRIVE_BUSY, LIBUM_POS_DRIVE_COMPLETED, LIBUM_POS_DRIVE_FAILED):
+            return status
+        errstr = self.lib.um_errorstr(status).decode()
+        raise UMError(f"UM Error: {status:d}: '{errstr}' from um_get_drive_status({dev})", status, None)
 
     def stop(self, dev, reason=None):
         """Stop the specified manipulator."""
@@ -1001,17 +1029,18 @@ class UMP(object):
                         self._last_move.pop(dev)
                         if not move.reached_target():
                             pos = move._read_position()
+                            target = np.array(move.target_pos, dtype=float)  # None -> nan
                             logger.debug(
                                 f'move finished but final position {pos!r} differs from target '
                                 f'{move.target_pos!r} by more than {move.fail_threshold!r}'
                             )
-                            diff = np.abs(pos - move.target_pos)
+                            diff = np.abs(pos - target)
                             axes_different = np.where(diff > move.fail_threshold)[0]
                             axis_msg = ", ".join([f"axis {i}: {diff[i]:.1f}" for i in axes_different])
 
                             coord_block = _fmt_position_block([
                                 ("final position", pos),
-                                ("target position", move.target_pos),
+                                ("target position", target),
                                 ("diff", diff),
                                 ("start position", move.start_pos),
                                 ("commanded axes", move.commanded_dest),
@@ -1024,7 +1053,7 @@ class UMP(object):
                                     if ax >= len(move.limits):
                                         continue
                                     low, high = move.limits[ax]
-                                    tgt = move.target_pos[ax]
+                                    tgt = target[ax]
                                     if low is not None and abs(tgt - low) <= limit_proximity_threshold:
                                         at_limit.append(f"axis {ax} (target {tgt:.3g} = configured min {low} µm)")
                                     elif high is not None and abs(tgt - high) <= limit_proximity_threshold:
@@ -1113,6 +1142,27 @@ class SensapexDevice(object):
 
         if callback is not None:
             self.add_callback(callback)
+
+        if self.ump.is_positionable(dev_id) and not self.is_stage:
+            self._warn_if_old_firmware()
+
+    def _warn_if_old_firmware(self):
+        """Log a warning if this uMp's firmware is older than UMP_MIN_FIRMWARE."""
+        logger = self.ump.get_logger(self.dev_id)
+        try:
+            version = tuple(self.ump.get_firmware_version(self.dev_id))
+        except Exception:
+            logger.warning(f"could not read the firmware version of device {self.dev_id}", exc_info=True)
+            return
+        if version[:4] < UMP_MIN_FIRMWARE:
+            fmt = ".".join
+            logger.warning(
+                f"device {self.dev_id}: uMp firmware {fmt(map(str, version[:4]))} is older than "
+                f"{fmt(map(str, UMP_MIN_FIRMWARE))}. Older firmware refuses gotos sent shortly after a move "
+                f"(moves fail with 'did not reach target' without moving) and drops position replies "
+                f"('no reply from device'). Update the firmware, then run zero calibration: updating resets "
+                f"the position counters."
+            )
 
     def set_limits(self, limits):
         """Set per-axis (min, max) µm limits, used to annotate missed-target errors."""
